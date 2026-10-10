@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Orders API with Cognito auth, WAF rate limiting, X-Ray tracing and a CloudWatch dashboard
+
+Parameters:
+  ApiName:
+    Type: String
+    Default: orders-api
+    Description: Name of the REST API (also used as the ApiName dimension in the dashboard)
+  RateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    Description: Max requests per client IP per 5 minutes before WAF blocks (WAF minimum is 10)
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Timeout: 10
+    MemorySize: 128
+    Tracing: Active            # AWS X-Ray; SAM also adds the X-Ray write permissions to the role
+
+Resources:
+  # ---------------------------------------------------------------- DynamoDB
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+
+  # ----------------------------------------------------------------- Cognito
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: orders-user-pool
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref OrdersUserPool
+      ClientName: orders-app-client
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH   # convenient for CLI testing; prefer SRP in real clients
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ------------------------------------------------------------- REST API
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref ApiName
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt OrdersUserPool.Arn
+
+  # --------------------------------------------------------------- Lambda
+  SaveOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Description: Saves an order item to the Orders table
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        SaveOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /orders
+            Method: post          # protected by the default Cognito authorizer
+
+  # ------------------------------------------------------------------ WAF
+  OrdersWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: orders-api-web-acl
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: OrdersApiWebAcl
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimit
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+
+  OrdersWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${OrdersApi}/stages/${OrdersApi.Stage}"
+      WebACLArn: !GetAtt OrdersWebAcl.Arn
+
+  # ------------------------------------------------------------ Dashboard
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-orders"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway: Count and 4XXError",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${ApiName}"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${ApiName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda: Invocations and Errors",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${SaveOrderFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${SaveOrderFunction}"]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  SaveOrderApiUrl:
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders"
+  UserPoolId:
+    Value: !Ref OrdersUserPool
+  UserPoolClientId:
+    Value: !Ref OrdersUserPoolClient
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-orders"

@@ -1,0 +1,92 @@
+name: Deploy SAM application
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # allows a manual run from the Actions tab
+
+# Only one deployment at a time; a newer push waits instead of cancelling a running deploy
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1        # change to your region
+  STACK_NAME: orders-service      # must match the stack name used for any manual deploy
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python (required by SAM CLI)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js (matches the Lambda runtime)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: sam validate --lint
+
+      - name: Build (packages the Lambda code from src/)
+        run: sam build
+
+      - name: Deploy (uploads the package and updates the stack and function code)
+        run: >
+          sam deploy
+          --stack-name "$STACK_NAME"
+          --region "$AWS_REGION"
+          --resolve-s3
+          --capabilities CAPABILITY_IAM
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+
+      - name: Show deployed Lambda function details
+        run: |
+          FUNCTION_NAME=$(aws cloudformation describe-stack-resource \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SaveOrderFunction \
+            --query StackResourceDetail.PhysicalResourceId --output text)
+
+          aws lambda get-function-configuration \
+            --function-name "$FUNCTION_NAME" \
+            --query '{Function:FunctionName,Runtime:Runtime,LastModified:LastModified,CodeSha256:CodeSha256,Tracing:TracingConfig.Mode}' \
+            --output table
+
+      - name: Publish stack outputs to the job summary
+        run: |
+          {
+            echo "### Stack outputs (\`$STACK_NAME\`)"
+            echo ""
+            echo "| Key | Value |"
+            echo "|-----|-------|"
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output text \
+              | while IFS=$'\t' read -r key value; do
+                  echo "| $key | $value |"
+                done
+          } >> "$GITHUB_STEP_SUMMARY"
