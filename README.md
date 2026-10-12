@@ -190,7 +190,7 @@ Then send a burst of requests. WAF evaluates the counts with a short delay, so b
 sam delete --stack-name orders-service
 ```
 
-This deletes the `Orders` table and its data, the user pool and its users, and the web ACL (which stops its monthly charge).
+This deletes the `Orders` table and its data, the user pool and its users, and the web ACL (which stops its monthly charge). See Part 4 for the complete tear-down checklist, including leftovers that `sam delete` does not remove.
 
 ---
 
@@ -343,6 +343,107 @@ Stored access keys work, but they never expire unless you rotate them. If you wa
 - Keep the repository private, or at least do not run deployment workflows on pull requests from forks. This workflow runs only on pushes to `main`.
 - Protect the `main` branch so only reviewed changes can trigger a deployment.
 - If a key is ever exposed, deactivate it in IAM immediately.
+
+---
+
+## Part 4: Tear down and stop all costs (keep the configuration)
+
+Everything is defined in this repository (`template.yaml`, `src/`, the workflow and this README), so you can delete all AWS resources and recreate them later with a single deploy. The commands below assume region `eu-central-1` and stack name `orders-service`; replace them with your own values.
+
+### 1. Stop the pipeline from redeploying
+
+The next push to `main` would rebuild everything, so disable the workflow first:
+
+```bash
+gh workflow disable "Deploy SAM application"
+```
+
+Or use the Actions tab (workflow menu > **Disable workflow**). To redeploy later, run `gh workflow enable "Deploy SAM application"`, then push or start it manually.
+
+### 2. Back up the data (optional)
+
+Deleting the stack deletes the `Orders` table with its items, and the Cognito users. For a small table, export the items to a local file:
+
+```bash
+aws dynamodb scan --table-name Orders --region eu-central-1 > orders-backup.json
+```
+
+Avoid DynamoDB's built-in backups for this purpose: they outlive the table and keep billing for storage. Do not commit the backup file to the repository if it contains customer data.
+
+### 3. Delete the stack
+
+```bash
+sam delete --stack-name orders-service --region eu-central-1
+```
+
+This removes the Lambda function, API Gateway, DynamoDB table, Cognito user pool, WAF web ACL (the main cost), CloudWatch dashboard, the Lambda IAM role, and the build artifacts SAM uploaded to S3.
+
+### 4. Remove leftovers that CloudFormation does not delete
+
+| Leftover | Cost | How to remove |
+|----------|------|---------------|
+| Lambda log group | Storage of logs (kept forever by default) | See below |
+| X-Ray traces | None to remove | They expire automatically after 30 days |
+| SAM helper stack and S3 bucket (`aws-sam-cli-managed-default`) | Almost nothing once empty | See below |
+
+Delete the log group:
+
+```bash
+aws logs describe-log-groups --region eu-central-1 \
+  --log-group-name-prefix /aws/lambda/orders-service \
+  --query "logGroups[].logGroupName" --output text
+
+aws logs delete-log-group --region eu-central-1 \
+  --log-group-name <name from the previous command>
+```
+
+Remove the SAM helper stack (optional). Empty the bucket in the S3 console first, because it is versioned, then:
+
+```bash
+aws cloudformation delete-stack --stack-name aws-sam-cli-managed-default --region eu-central-1
+```
+
+Skip this if you plan to redeploy, since SAM reuses the bucket.
+
+### 5. Secure the deployment credentials
+
+The IAM user costs nothing, but its access keys remain valid while the GitHub secrets exist. Choose one:
+
+```bash
+# Keep the user for later, but disable the key
+aws iam update-access-key --user-name github-actions-sam-deploy \
+  --access-key-id <AccessKeyId> --status Inactive
+
+# Or remove the user completely
+aws iam delete-access-key --user-name github-actions-sam-deploy --access-key-id <AccessKeyId>
+aws iam delete-user-policy --user-name github-actions-sam-deploy --policy-name sam-deploy
+aws iam delete-user --user-name github-actions-sam-deploy
+```
+
+If you delete the user, also remove the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` secrets under **Settings > Secrets and variables > Actions**.
+
+### 6. Verify nothing is left
+
+```bash
+# Should report that the stack does not exist
+aws cloudformation describe-stacks --stack-name orders-service --region eu-central-1
+
+# Should be empty (no web ACLs means no WAF charges)
+aws wafv2 list-web-acls --scope REGIONAL --region eu-central-1
+
+# Should not list Orders
+aws dynamodb list-tables --region eu-central-1
+```
+
+In the AWS console, **Billing and Cost Management > Cost Explorer** shows whether charges have stopped; it can take a day to update. A monthly budget alert (Billing > Budgets) is a cheap safeguard against surprises.
+
+### Redeploying later
+
+1. Re-enable the workflow: `gh workflow enable "Deploy SAM application"`.
+2. Make sure the IAM user, its access key and the two GitHub secrets exist (Part 3, steps 1 and 2).
+3. Push to `main`, or run the workflow from the Actions tab (or `sam build && sam deploy` locally).
+
+All resources are recreated from the template. The table will be empty and users must sign up again; restore the exported items if needed.
 
 ---
 
