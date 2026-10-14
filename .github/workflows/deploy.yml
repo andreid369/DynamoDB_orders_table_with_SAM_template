@@ -16,6 +16,7 @@ permissions:
 env:
   AWS_REGION: eu-central-1        # change to your region
   STACK_NAME: orders-service      # must match the stack name used for any manual deploy
+  REPLICA_REGION: eu-west-1       # DynamoDB global table replica; must differ from AWS_REGION
 
 jobs:
   deploy:
@@ -49,6 +50,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check that the replica Region differs from the primary Region
+        run: |
+          if [ "$AWS_REGION" = "$REPLICA_REGION" ]; then
+            echo "REPLICA_REGION must differ from AWS_REGION" >&2
+            exit 1
+          fi
+
       - name: Validate template
         run: sam validate --lint
 
@@ -62,6 +70,7 @@ jobs:
           --region "$AWS_REGION"
           --resolve-s3
           --capabilities CAPABILITY_IAM
+          --parameter-overrides "ReplicaRegion=$REPLICA_REGION"
           --no-confirm-changeset
           --no-fail-on-empty-changeset
 

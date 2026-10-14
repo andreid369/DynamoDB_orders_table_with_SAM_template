@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Orders API with Cognito auth, WAF rate limiting, X-Ray tracing and a CloudWatch dashboard
+Description: Orders API - Cognito auth, WAF rate limiting, Lambda writer, direct API Gateway to DynamoDB reader, global table, X-Ray and dashboard
 
 Parameters:
   ApiName:
@@ -12,6 +12,11 @@ Parameters:
     Default: 100
     MinValue: 10
     Description: Max requests per client IP per 5 minutes before WAF blocks (WAF minimum is 10)
+  ReplicaRegion:
+    Type: String
+    Default: eu-west-1
+    AllowedPattern: '^[a-z]{2}(-[a-z]+)+-[0-9]+$'
+    Description: Secondary AWS Region for the DynamoDB global table replica (must differ from the stack's Region)
 
 Globals:
   Function:
@@ -22,11 +27,13 @@ Globals:
     Tracing: Active            # AWS X-Ray; SAM also adds the X-Ray write permissions to the role
 
 Resources:
-  # ---------------------------------------------------------------- DynamoDB
-  OrdersTable:
-    Type: AWS::DynamoDB::Table
+  # ------------------------------------------------- DynamoDB global table
+  # A global table replicates every write to the replica Region (disaster recovery,
+  # multi-Region availability). Streams are required by global tables.
+  # No TableName on purpose: a fixed name would clash with the table this replaces.
+  OrdersGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
     Properties:
-      TableName: Orders
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: orderId
@@ -38,6 +45,11 @@ Resources:
           KeyType: HASH
         - AttributeName: itemId
           KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        - Region: !Ref AWS::Region      # primary (this stack's Region)
+        - Region: !Ref ReplicaRegion    # secondary (disaster recovery)
 
   # ----------------------------------------------------------------- Cognito
   OrdersUserPool:
@@ -65,7 +77,30 @@ Resources:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
 
+  # -------------------------------------- IAM role for the direct integration
+  # API Gateway assumes this role to call DynamoDB. Read-only, one table.
+  ApiDynamoDbReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt OrdersGlobalTable.Arn
+
   # ------------------------------------------------------------- REST API
+  # GET  /orders/{orderId}  -> DynamoDB Query directly (no Lambda), defined below
+  # POST /orders            -> Lambda, added by SAM from the function's Api event
   OrdersApi:
     Type: AWS::Serverless::Api
     Properties:
@@ -76,22 +111,119 @@ Resources:
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt OrdersUserPool.Arn
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: !Ref ApiName
+          version: '1.0'
+        paths:
+          "/orders/{orderId}":
+            get:
+              summary: Get all items of an order (API Gateway calls DynamoDB directly)
+              produces:
+                - application/json
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  type: string
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                '200':
+                  description: Items of the order
+                '400':
+                  description: Bad request
+                '500':
+                  description: Server error
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/Query"
+                credentials: !GetAtt ApiDynamoDbReadRole.Arn
+                passthroughBehavior: when_no_templates
+                # Request mapping: path parameter -> DynamoDB Query request body.
+                # escapeJavaScript + replaceAll keeps the value a valid JSON string.
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "TableName": "${OrdersGlobalTable}",
+                      "KeyConditionExpression": "orderId = :orderId",
+                      "ExpressionAttributeValues": {
+                        ":orderId": { "S": "$util.escapeJavaScript($input.params('orderId')).replaceAll("\\'","'")" }
+                      }
+                    }
+                responses:
+                  # Response mapping: DynamoDB JSON ({"qty":{"N":"2"}}) -> plain JSON ({"qty":2}).
+                  # Handles S, N and BOOL attributes; other types (L, M, SS, ...) are returned as null.
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: |
+                        #set($root = $input.path('$'))
+                        {
+                          "orderId": "$util.escapeJavaScript($input.params('orderId')).replaceAll("\\'","'")",
+                          "count": $root.Count,
+                          "items": [
+                        #foreach($item in $root.Items)
+                        #if($foreach.count > 1),#end
+                            {
+                        #foreach($attr in $item.keySet())
+                        #set($v = $item.get($attr))
+                        #if($foreach.count > 1),#end
+                        #if("$!v.S" != "")
+                              "$util.escapeJavaScript($attr).replaceAll("\\'","'")": "$util.escapeJavaScript($v.S).replaceAll("\\'","'")"
+                        #elseif("$!v.N" != "")
+                              "$util.escapeJavaScript($attr).replaceAll("\\'","'")": $v.N
+                        #elseif("$!v.BOOL" != "")
+                              "$util.escapeJavaScript($attr).replaceAll("\\'","'")": $v.BOOL
+                        #{else}
+                              "$util.escapeJavaScript($attr).replaceAll("\\'","'")": null
+                        #end
+                        #end
+                            }
+                        #end
+                          ]
+                        }
+                  '4\d{2}':
+                    statusCode: '400'
+                    responseTemplates:
+                      application/json: '{"message": "Bad request"}'
+                  '5\d{2}':
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message": "Internal error"}'
 
   # --------------------------------------------------------------- Lambda
+  # Writer function. Bundled with esbuild (minified, AWS SDK left out because the
+  # Node.js 22 runtime already provides it), so the package is a few KB.
   SaveOrderFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        OutExtension:
+          - .js=.mjs
+        EntryPoints:
+          - app.mjs
+        External:
+          - '@aws-sdk/*'
     Properties:
       CodeUri: src/
       Handler: app.handler
-      Description: Saves an order item to the Orders table
+      Description: Saves an order item to the Orders global table
       Environment:
         Variables:
-          TABLE_NAME: !Ref OrdersTable
+          TABLE_NAME: !Ref OrdersGlobalTable
       Policies:
         - Statement:
             - Effect: Allow
               Action: dynamodb:PutItem
-              Resource: !GetAtt OrdersTable.Arn
+              Resource: !GetAtt OrdersGlobalTable.Arn
       Events:
         SaveOrder:
           Type: Api
@@ -176,9 +308,18 @@ Resources:
 
 Outputs:
   OrdersTableName:
-    Value: !Ref OrdersTable
+    Description: Name of the global table (same name in every replica Region)
+    Value: !Ref OrdersGlobalTable
+  OrdersTableStreamArn:
+    Value: !GetAtt OrdersGlobalTable.StreamArn
+  ReplicaRegion:
+    Value: !Ref ReplicaRegion
   SaveOrderApiUrl:
+    Description: POST here (Lambda)
     Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders"
+  GetOrderApiUrl:
+    Description: GET here, replace ORDER_ID (direct DynamoDB integration)
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/orders/ORDER_ID"
   UserPoolId:
     Value: !Ref OrdersUserPool
   UserPoolClientId:

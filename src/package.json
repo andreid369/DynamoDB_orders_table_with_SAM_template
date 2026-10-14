@@ -1,0 +1,10 @@
+{
+  "name": "save-order-function",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lambda function that saves orders to DynamoDB",
+  "devDependencies": {
+    "esbuild": "~0.25.0"
+  }
+}

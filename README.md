@@ -1,17 +1,34 @@
 # Orders Service (AWS SAM)
 
-A serverless application that saves orders to DynamoDB behind an authenticated, rate-limited REST API.
+A serverless application that saves orders to a multi-Region DynamoDB table behind an authenticated, rate-limited REST API.
 
 | Component | Details |
 |-----------|---------|
-| **DynamoDB** | Table `Orders`, partition key `orderId`, sort key `itemId`, on-demand capacity |
-| **Lambda** | Node.js 22 function that saves one order item per request, X-Ray tracing enabled |
-| **API Gateway** | REST API, `POST /orders` on the `Prod` stage |
-| **Cognito** | User pool and app client; the user pool is the API's authorizer |
+| **DynamoDB global table** | Partition key `orderId`, sort key `itemId`, on-demand capacity, DynamoDB Streams enabled, replica in a secondary Region |
+| **Lambda (writer)** | Node.js 22, bundled with esbuild (a few KB), SDK client created outside the handler, X-Ray tracing enabled |
+| **API Gateway (REST)** | `POST /orders` calls the Lambda; `GET /orders/{orderId}` calls DynamoDB directly, with no Lambda |
+| **Cognito** | User pool and app client; the user pool is the API's authorizer for both methods |
 | **WAF** | Web ACL with a rate-based rule (default 100 requests per 5 minutes per IP) attached to the API stage |
 | **CloudWatch** | Dashboard with API Gateway `Count`, `4XXError` and Lambda `Invocations`, `Errors` |
-| **IAM** | Lambda execution role created by SAM with `dynamodb:PutItem` on the table only |
+| **IAM** | Lambda role (`dynamodb:PutItem`, one table) and API Gateway role (`dynamodb:Query`, one table), both created by the template |
 | **CI/CD** | GitHub Actions workflow deploys on every push to `main` |
+
+```
+                          +--------------------+
+ client --(Cognito JWT)-->|  WAF + API Gateway |
+                          +----+----------+----+
+                   POST /orders|          |GET /orders/{orderId}
+                               v          |  (mapping templates, no Lambda)
+                         +-----------+    |
+                         |  Lambda   |    |
+                         +-----+-----+    |
+                               |PutItem   |Query
+                               v          v
+                     +------------------------------+
+                     |  DynamoDB global table       |
+                     |  primary Region  <--replicates--> replica Region
+                     +------------------------------+
+```
 
 ## Project structure
 
@@ -21,7 +38,8 @@ A serverless application that saves orders to DynamoDB behind an authenticated, 
 │   └── workflows/
 │       └── deploy.yml
 ├── src/
-│   └── app.mjs
+│   ├── app.mjs
+│   └── package.json
 ├── .gitignore
 ├── template.yaml
 └── README.md
@@ -34,6 +52,7 @@ A serverless application that saves orders to DynamoDB behind an authenticated, 
 | AWS account | Where the stack is deployed | |
 | AWS CLI | Credentials and general AWS access | `aws --version` |
 | AWS SAM CLI | Build and deploy (separate from the AWS CLI) | `sam --version` |
+| Node.js 22 and npm | `sam build` runs `npm` and esbuild | `node --version` |
 | Git | Version control | `git --version` |
 | GitHub account | Repository and Actions | |
 
@@ -43,6 +62,75 @@ Configure AWS credentials once:
 aws configure
 aws sts get-caller-identity   # confirms which account you are using
 ```
+
+---
+
+## How it works
+
+### Lambda optimisation
+
+- **Small package.** `template.yaml` tells `sam build` to bundle `src/app.mjs` with esbuild (minified, ES2022, no source map). The AWS SDK v3 is marked `External` because the Node.js 22 runtime already includes it, so the deployed package contains only your code (a few KB instead of megabytes). `src/package.json` only lists esbuild as a dev dependency, so nothing else is installed into the package.
+- **Initialisation outside the handler.** The table name is read once, the `DynamoDBClient` and `DynamoDBDocumentClient` are created once at module load, and constants such as the response headers are defined once. All of this runs on a cold start only; warm invocations reuse it. The handler contains only per-request work. SDK v3 keeps HTTPS connections alive by default, so no extra connection-reuse setting is needed. If `TABLE_NAME` is missing, the cold start fails immediately instead of failing every request.
+- **Input validation.** `orderId` and `itemId` must be non-empty strings (a wrong type is rejected with `400` instead of causing a DynamoDB error), and `createdAt` is always set by the server.
+- Optional: run `npm install --package-lock-only` inside `src/` and commit `package-lock.json` to make esbuild installs reproducible.
+
+### Direct API Gateway to DynamoDB integration (no Lambda)
+
+`GET /orders/{orderId}` is defined in the API's OpenAPI body in `template.yaml` as an AWS service integration:
+
+- API Gateway assumes `ApiDynamoDbReadRole`, which is allowed only `dynamodb:Query` on this one table.
+- **Request mapping template** turns the path parameter into a DynamoDB `Query` request (`orderId = :orderId`). The value is escaped so a hostile `orderId` cannot change the query.
+- **Response mapping template** converts DynamoDB's typed JSON (`{"qty":{"N":"2"}}`) into plain JSON (`{"qty":2}`).
+- Error mapping: any DynamoDB `4xx` becomes `400 {"message":"Bad request"}` and any `5xx` becomes `500 {"message":"Internal error"}`.
+- The Cognito authorizer and the WAF rate limit apply to this method too.
+
+Example response:
+
+```json
+{
+  "orderId": "o-1",
+  "count": 2,
+  "items": [
+    { "orderId": "o-1", "itemId": "i-1", "qty": 2, "price": 19.9, "createdAt": "2026-10-14T10:00:00.000Z" },
+    { "orderId": "o-1", "itemId": "i-2", "qty": 1, "createdAt": "2026-10-14T10:00:05.000Z" }
+  ]
+}
+```
+
+Limits of this approach:
+
+- The mapping template converts string (`S`), number (`N`) and boolean (`BOOL`) attributes. Lists, maps and sets come back as `null`; extend the template if you store them.
+- A `Query` returns at most 1 MB per call and the template does not paginate. This is plenty for the items of one order.
+- An unknown `orderId` returns `200` with `"count": 0` and an empty list, not `404`.
+
+### Global table and disaster recovery
+
+The table is an `AWS::DynamoDB::GlobalTable` with DynamoDB Streams enabled (`NEW_AND_OLD_IMAGES`, required by global tables) and two replicas: the stack's own Region and `ReplicaRegion` (default `eu-west-1`). Every write is replicated to the other Region, usually within about a second. The replica Region must differ from the stack's Region.
+
+What this gives you: a second, up-to-date copy of your data in another Region, and the ability to read and write the table there if the primary Region has problems.
+
+What it does not give you: automatic API failover. The API, Lambda and Cognito pool live in the primary Region only. For full multi-Region availability you would also deploy the API and Lambda in the replica Region and add Route 53 failover, which this project does not do.
+
+Point-in-time recovery is not enabled, to avoid its storage charge. Add this under `Replicas` if you want it:
+
+```yaml
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+```
+
+#### Important: replacing the old table
+
+CloudFormation cannot convert an `AWS::DynamoDB::Table` into a global table in place. The template therefore replaces the old `OrdersTable` with a new `OrdersGlobalTable` (and no longer sets a fixed `TableName`, because the old table `Orders` would clash). If you deployed the previous version of this project:
+
+1. **Existing data is not copied.** The old table is deleted by the update. Export anything you need first:
+
+   ```bash
+   aws dynamodb scan --table-name Orders --region eu-central-1 > orders-backup.json
+   ```
+
+2. The new table has a generated name, shown in the stack output `OrdersTableName`. The Lambda function and the API role use it automatically.
+3. Update the deployment IAM user's policy first (see Part 3), otherwise creating the replica fails.
 
 ---
 
@@ -109,12 +197,15 @@ Suggested answers for `--guided`:
 |--------|-------|
 | Stack Name | `orders-service` (use the same name as `STACK_NAME` in the workflow) |
 | AWS Region | for example `eu-central-1` |
+| Parameter ReplicaRegion | for example `eu-west-1` (must differ from the stack Region) |
 | Confirm changes before deploy | `y` |
 | Allow SAM CLI IAM role creation | `y` |
 | Disable rollback | `n` |
 | Save arguments to configuration file | `y` |
 
-Later deployments: `sam build && sam deploy`.
+Creating the replica makes the first deployment take a few minutes longer. Later deployments: `sam build && sam deploy`.
+
+`sam build` prints something like `Running NodejsNpmEsbuildBuilder`. To see the size reduction, run `ls -l .aws-sam/build/SaveOrderFunction/`: it should contain a single `app.mjs` of a few KB.
 
 ### Test the deployed API
 
@@ -143,7 +234,7 @@ TOKEN=$(aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH \
   --query AuthenticationResult.IdToken --output text)
 ```
 
-Call the API:
+**Save an order item (Lambda):**
 
 ```bash
 curl -X POST "<SaveOrderApiUrl>" \
@@ -152,24 +243,43 @@ curl -X POST "<SaveOrderApiUrl>" \
   -d '{"orderId":"o-1","itemId":"i-1","qty":2,"price":19.9}'
 ```
 
+**Read an order (direct DynamoDB integration):** use `GetOrderApiUrl` and replace `ORDER_ID`:
+
+```bash
+curl -H "Authorization: $TOKEN" \
+  "https://<api-id>.execute-api.<region>.amazonaws.com/Prod/orders/o-1"
+```
+
 | Result | Meaning |
 |--------|---------|
-| `201` | Order item saved |
-| `409` | That `orderId` + `itemId` already exists |
+| `201` (POST) | Order item saved |
+| `409` (POST) | That `orderId` + `itemId` already exists |
+| `400` (POST) | Invalid JSON, or `orderId`/`itemId` missing or not a string |
+| `200` (GET) | Items of the order (empty list if none) |
+| `400`/`500` (GET) | DynamoDB rejected the request (see Troubleshooting) |
 | `401` | Missing or invalid token |
 | `403` | Blocked by WAF (rate limit exceeded) |
 
-Check the data:
+### Check replication
 
 ```bash
-aws dynamodb query --table-name Orders \
+TABLE=$(aws cloudformation describe-stacks --stack-name orders-service \
+  --region eu-central-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='OrdersTableName'].OutputValue" --output text)
+
+# Replica status (each replica should be ACTIVE)
+aws dynamodb describe-table --table-name "$TABLE" --region eu-central-1 \
+  --query "Table.{Status:TableStatus,Replicas:Replicas[].{Region:RegionName,Status:ReplicaStatus},Stream:StreamSpecification}"
+
+# The item you saved through the API should be readable in the replica Region
+aws dynamodb query --table-name "$TABLE" --region eu-west-1 \
   --key-condition-expression "orderId = :o" \
   --expression-attribute-values '{":o":{"S":"o-1"}}'
 ```
 
 ### Monitoring
 
-- **Dashboard:** open the `DashboardUrl` stack output (CloudWatch dashboard `<stack-name>-orders`).
+- **Dashboard:** open the `DashboardUrl` stack output (CloudWatch dashboard `<stack-name>-orders`). The Lambda widget only counts POST requests; GET requests appear only in the API Gateway widget because they never invoke Lambda.
 - **Logs:** `sam logs --stack-name orders-service --name SaveOrderFunction --tail`
 - **Traces:** CloudWatch console > X-Ray traces (or Application Signals > Traces).
 - **WAF:** blocked requests appear under the `BlockedRequests` metric (namespace `AWS/WAFV2`) and in the web ACL's sampled requests.
@@ -190,7 +300,7 @@ Then send a burst of requests. WAF evaluates the counts with a short delay, so b
 sam delete --stack-name orders-service
 ```
 
-This deletes the `Orders` table and its data, the user pool and its users, and the web ACL (which stops its monthly charge). See Part 4 for the complete tear-down checklist, including leftovers that `sam delete` does not remove.
+See Part 4 for the complete tear-down checklist, including the replica Region and leftovers that `sam delete` does not remove.
 
 ---
 
@@ -200,10 +310,11 @@ The workflow in `.github/workflows/deploy.yml` runs on every push to `main` (and
 
 1. Checks out the code and installs Python, Node.js 22 and the SAM CLI.
 2. Configures AWS credentials from GitHub repository secrets.
-3. Runs `sam validate --lint`.
-4. Runs `sam build`, which packages the Lambda code from `src/`.
-5. Runs `sam deploy`, which uploads the package to the SAM-managed S3 bucket and updates the stack, including the function code.
-6. Prints the Lambda function's last-modified time and code hash, and lists the stack outputs in the job summary.
+3. Checks that `REPLICA_REGION` differs from `AWS_REGION`.
+4. Runs `sam validate --lint`.
+5. Runs `sam build`, which bundles the Lambda code from `src/` with esbuild.
+6. Runs `sam deploy`, which uploads the package to the SAM-managed S3 bucket and updates the stack, including the function code.
+7. Prints the Lambda function's last-modified time and code hash, and lists the stack outputs in the job summary.
 
 Only one deployment runs at a time; a newer push waits for the running one to finish.
 
@@ -228,6 +339,7 @@ Do not use your personal or root credentials. Save the following as `deploy-poli
         "cloudwatch:*",
         "logs:*",
         "xray:*",
+        "iam:CreateServiceLinkedRole",
         "iam:CreateRole",
         "iam:DeleteRole",
         "iam:GetRole",
@@ -246,9 +358,18 @@ Do not use your personal or root credentials. Save the following as `deploy-poli
 }
 ```
 
-This is scoped by service, not by resource. It is fine for a personal or sandbox account; tighten the `Resource` entries before using it for anything important. Because the user can create IAM roles, treat these keys as highly sensitive.
+`iam:CreateServiceLinkedRole` is needed so DynamoDB can create the service-linked role it uses for global table replication. **If you created the user with the earlier version of this policy, update it now:**
 
-Create the user and its access key:
+```bash
+aws iam put-user-policy \
+  --user-name github-actions-sam-deploy \
+  --policy-name sam-deploy \
+  --policy-document file://deploy-policy.json
+```
+
+This policy is scoped by service, not by resource. It is fine for a personal or sandbox account; tighten the `Resource` entries before using it for anything important. Because the user can create IAM roles, treat these keys as highly sensitive.
+
+Create the user and its access key (first time only):
 
 ```bash
 aws iam create-user --user-name github-actions-sam-deploy
@@ -279,7 +400,7 @@ gh secret set AWS_SECRET_ACCESS_KEY
 | `AWS_ACCESS_KEY_ID` | Access key ID of the `github-actions-sam-deploy` user |
 | `AWS_SECRET_ACCESS_KEY` | Matching secret access key |
 
-### 3. Set the region and stack name
+### 3. Set the Regions and stack name
 
 At the top of `.github/workflows/deploy.yml`:
 
@@ -287,19 +408,20 @@ At the top of `.github/workflows/deploy.yml`:
 env:
   AWS_REGION: eu-central-1
   STACK_NAME: orders-service
+  REPLICA_REGION: eu-west-1
 ```
 
-If you already deployed manually in Part 2, keep `STACK_NAME` identical to that stack so the workflow updates it instead of trying to create a second stack. A second stack would fail because the `Orders` table name is fixed.
+If you already deployed manually in Part 2, keep `STACK_NAME` identical to that stack so the workflow updates it instead of trying to create a second one.
 
 ### 4. Commit and push
 
 ```bash
-git add .github/workflows/deploy.yml
-git commit -m "Add GitHub Actions deployment"
+git add .
+git commit -m "Optimise Lambda, add direct DynamoDB integration and global table"
 git push
 ```
 
-Open the repository's **Actions** tab to watch the run. When it finishes, the run's **Summary** page lists the API URL, user pool ID, client ID and dashboard URL.
+Open the repository's **Actions** tab to watch the run. When it finishes, the run's **Summary** page lists the API URLs, table name, user pool ID, client ID and dashboard URL.
 
 ### 5. Update the Lambda code
 
@@ -348,7 +470,7 @@ Stored access keys work, but they never expire unless you rotate them. If you wa
 
 ## Part 4: Tear down and stop all costs (keep the configuration)
 
-Everything is defined in this repository (`template.yaml`, `src/`, the workflow and this README), so you can delete all AWS resources and recreate them later with a single deploy. The commands below assume region `eu-central-1` and stack name `orders-service`; replace them with your own values.
+Everything is defined in this repository (`template.yaml`, `src/`, the workflow and this README), so you can delete all AWS resources and recreate them later with a single deploy. The commands below assume primary Region `eu-central-1`, replica Region `eu-west-1` and stack name `orders-service`; replace them with your own values.
 
 ### 1. Stop the pipeline from redeploying
 
@@ -362,10 +484,14 @@ Or use the Actions tab (workflow menu > **Disable workflow**). To redeploy later
 
 ### 2. Back up the data (optional)
 
-Deleting the stack deletes the `Orders` table with its items, and the Cognito users. For a small table, export the items to a local file:
+Deleting the stack deletes the table, its replica and the Cognito users. For a small table, export the items to a local file:
 
 ```bash
-aws dynamodb scan --table-name Orders --region eu-central-1 > orders-backup.json
+TABLE=$(aws cloudformation describe-stacks --stack-name orders-service \
+  --region eu-central-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='OrdersTableName'].OutputValue" --output text)
+
+aws dynamodb scan --table-name "$TABLE" --region eu-central-1 > orders-backup.json
 ```
 
 Avoid DynamoDB's built-in backups for this purpose: they outlive the table and keep billing for storage. Do not commit the backup file to the repository if it contains customer data.
@@ -376,7 +502,7 @@ Avoid DynamoDB's built-in backups for this purpose: they outlive the table and k
 sam delete --stack-name orders-service --region eu-central-1
 ```
 
-This removes the Lambda function, API Gateway, DynamoDB table, Cognito user pool, WAF web ACL (the main cost), CloudWatch dashboard, the Lambda IAM role, and the build artifacts SAM uploaded to S3.
+This removes the Lambda function, API Gateway, the global table including its replica, the Cognito user pool, the WAF web ACL (the main fixed cost), the CloudWatch dashboard, the IAM roles, and the build artifacts SAM uploaded to S3.
 
 ### 4. Remove leftovers that CloudFormation does not delete
 
@@ -431,9 +557,12 @@ aws cloudformation describe-stacks --stack-name orders-service --region eu-centr
 # Should be empty (no web ACLs means no WAF charges)
 aws wafv2 list-web-acls --scope REGIONAL --region eu-central-1
 
-# Should not list Orders
+# Should not list your orders table, in BOTH Regions
 aws dynamodb list-tables --region eu-central-1
+aws dynamodb list-tables --region eu-west-1
 ```
+
+If the replica table is still listed in the replica Region, delete it there (`aws dynamodb delete-table --table-name <name> --region eu-west-1`).
 
 In the AWS console, **Billing and Cost Management > Cost Explorer** shows whether charges have stopped; it can take a day to update. A monthly budget alert (Billing > Budgets) is a cheap safeguard against surprises.
 
@@ -449,7 +578,18 @@ All resources are recreated from the template. The table will be empty and users
 
 ## Cost notes (free tier)
 
-Most services here have a free tier or free allowance (Lambda, DynamoDB on-demand for small usage, Cognito, X-Ray, CloudWatch dashboards within limits). **AWS WAF is not free**: expect a few dollars per month for the web ACL and its rule while the stack exists (about $6/month at published prices; verify on the AWS pricing page). New accounts on the Free Plan can use their credits for this. To stop WAF charges, delete the stack (`sam delete`) when you are not testing. API Gateway REST API free allowances depend on your account type; check the AWS Free Tier page for your account.
+Everything in this project deploys on an AWS free tier / Free Plan account, but not everything is free.
+
+| Item | Cost |
+|------|------|
+| **AWS WAF** | Not free. Roughly $6/month while the stack exists (web ACL plus one rule, plus a small per-request charge); verify on the AWS pricing page. This is the main fixed cost. |
+| **DynamoDB** | Always-free allowances: 25 GB storage per Region and 2.5 million Streams read requests per month. The free read/write capacity units (including the 25 replicated write units for global tables) apply to provisioned capacity, not to this on-demand table, so requests are billed per million at tiny rates; a few test requests cost a fraction of a cent. Replicated writes cost more than normal writes and the replica stores its own copy of the data. There is no hourly charge for the replica. |
+| **DynamoDB Streams** | Enabling Streams is free; the first 2.5 million Streams read requests per month are included. Nothing in this project reads the stream itself. |
+| **Lambda, Cognito, X-Ray, CloudWatch dashboard** | Within the free allowances at test volumes. |
+| **API Gateway (REST)** | Free allowance depends on your account type (older accounts: a free calls allowance for 12 months). The direct DynamoDB integration costs the same as any other REST API call. |
+| **Point-in-time recovery** | Not enabled (it is billed per GB). |
+
+New accounts on the Free Plan can use their AWS credits for these charges. To stop all charges, follow Part 4 and delete the stack (this also deletes the replica) when you are not testing.
 
 ---
 
@@ -459,10 +599,18 @@ Most services here have a free tier or free allowance (Lambda, DynamoDB on-deman
 |---------|----------------------|
 | Workflow fails at "Configure AWS credentials" | The `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` secret is missing or misspelled. |
 | `AccessDenied` during `sam deploy` | The IAM user lacks a permission. The error names the missing action; add it to the policy. |
-| `Orders already exists` / stack in `ROLLBACK_COMPLETE` | A table named `Orders` exists from another stack, or `STACK_NAME` differs from your manual deploy. Use the same stack name, or delete the old table/stack. If a stack is stuck in `ROLLBACK_COMPLETE`, delete it and redeploy. |
+| `not authorized to perform: iam:CreateServiceLinkedRole` | Add that action to the deployment policy (Part 3) and re-run. |
+| Stack update fails creating the global table | The replica Region equals the stack Region, or is misspelled or not enabled for your account. Use a different, valid Region. |
+| `Orders already exists` / stack in `ROLLBACK_COMPLETE` | A table with that name exists from an older stack, or `STACK_NAME` differs from your manual deploy. Use the same stack name, or delete the old table/stack. If a stack is stuck in `ROLLBACK_COMPLETE`, delete it and redeploy. |
+| `sam build` fails in the esbuild step | Node.js/npm is missing or has no network access (esbuild is downloaded with `npm install`). Install Node.js 22, check `src/package.json` exists, and retry. |
+| `Cannot find module 'app'` / handler not found in Lambda | The build must produce `app.mjs`. Check the `OutExtension` and `EntryPoints` lines under the function's `Metadata` and that the handler is `app.handler`. |
 | `sam: command not found` locally | The SAM CLI is separate from the AWS CLI; install it separately. |
 | `Requires capabilities : [CAPABILITY_IAM]` | Add `--capabilities CAPABILITY_IAM` (already set in the workflow). |
 | `401 Unauthorized` from the API | Missing or expired token. Send the **ID token** in the `Authorization` header (tokens last 1 hour by default). |
-| `403 Forbidden` from the API | WAF rate limit exceeded, or wrong path. Wait a few minutes and check the path ends in `/Prod/orders`. |
+| `403 Forbidden` from the API | WAF rate limit exceeded, or wrong path. Wait a few minutes and check the URL. |
+| `GET` returns `{"message":"Bad request"}` | DynamoDB returned a 4xx. Typical causes: the API role lacks `dynamodb:Query` on the table, or the table name in the request mapping is wrong. Turn on API Gateway execution logging for the stage to see the DynamoDB error. |
+| `GET` returns `{"message":"Internal error"}` | DynamoDB returned a 5xx or throttled. Retry; check the table in the console. |
+| `GET` shows `null` for an attribute | That attribute is a list, map or set, which the response mapping does not convert. |
+| Dashboard Lambda widget is empty after a `GET` | Expected: `GET /orders/{orderId}` does not invoke Lambda. |
 | Dashboard widgets are empty | Metrics only appear after the API has received traffic; send a few requests and widen the time range. |
 | `The parameter Limit must be at least 10` | WAF's rate-based rule minimum is 10; set `RateLimit` to 10 or higher. |
