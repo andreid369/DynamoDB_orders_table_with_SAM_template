@@ -38,6 +38,11 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install esbuild (sam build uses it to bundle the Lambda code)
+        run: |
+          npm install --global esbuild@0.25
+          esbuild --version
+
       - name: Set up AWS SAM CLI
         uses: aws-actions/setup-sam@v2
         with:

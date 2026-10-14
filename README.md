@@ -602,6 +602,7 @@ New accounts on the Free Plan can use their AWS credits for these charges. To st
 | `not authorized to perform: iam:CreateServiceLinkedRole` | Add that action to the deployment policy (Part 3) and re-run. |
 | Stack update fails creating the global table | The replica Region equals the stack Region, or is misspelled or not enabled for your account. Use a different, valid Region. |
 | `Orders already exists` / stack in `ROLLBACK_COMPLETE` | A table with that name exists from an older stack, or `STACK_NAME` differs from your manual deploy. Use the same stack name, or delete the old table/stack. If a stack is stuck in `ROLLBACK_COMPLETE`, delete it and redeploy. |
+| `Cannot find esbuild. esbuild must be installed on the host machine` | `src/package.json` is missing, in the wrong folder, or not committed (check with `git ls-files src/`). The workflow also installs esbuild globally as a safeguard; for local builds run `npm install --global esbuild@0.25` or fix `src/package.json`. |
 | `sam build` fails in the esbuild step | Node.js/npm is missing or has no network access (esbuild is downloaded with `npm install`). Install Node.js 22, check `src/package.json` exists, and retry. |
 | `Cannot find module 'app'` / handler not found in Lambda | The build must produce `app.mjs`. Check the `OutExtension` and `EntryPoints` lines under the function's `Metadata` and that the handler is `app.handler`. |
 | `sam: command not found` locally | The SAM CLI is separate from the AWS CLI; install it separately. |
