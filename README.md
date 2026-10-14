@@ -339,6 +339,7 @@ Do not use your personal or root credentials. Save the following as `deploy-poli
         "cloudwatch:*",
         "logs:*",
         "xray:*",
+        "application-autoscaling:*",
         "iam:CreateServiceLinkedRole",
         "iam:CreateRole",
         "iam:DeleteRole",
@@ -358,7 +359,7 @@ Do not use your personal or root credentials. Save the following as `deploy-poli
 }
 ```
 
-`iam:CreateServiceLinkedRole` is needed so DynamoDB can create the service-linked role it uses for global table replication. **If you created the user with the earlier version of this policy, update it now:**
+Two entries exist for global tables: `iam:CreateServiceLinkedRole` lets DynamoDB create the service-linked role it uses for replication, and `application-autoscaling:*` is used by CloudFormation when it creates and deletes a global table (even an on-demand one). **If you created the user with an earlier version of this policy, update it now:**
 
 ```bash
 aws iam put-user-policy \
@@ -600,6 +601,7 @@ New accounts on the Free Plan can use their AWS credits for these charges. To st
 | Workflow fails at "Configure AWS credentials" | The `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` secret is missing or misspelled. |
 | `AccessDenied` during `sam deploy` | The IAM user lacks a permission. The error names the missing action; add it to the policy. |
 | `not authorized to perform: iam:CreateServiceLinkedRole` | Add that action to the deployment policy (Part 3) and re-run. |
+| `not authorized to perform: application-autoscaling:DeregisterScalableTarget` (or other `application-autoscaling:` actions) | Add `application-autoscaling:*` to the deployment policy (Part 3) and re-run. The stack rolls back safely to its previous state in the meantime. |
 | Stack update fails creating the global table | The replica Region equals the stack Region, or is misspelled or not enabled for your account. Use a different, valid Region. |
 | `Orders already exists` / stack in `ROLLBACK_COMPLETE` | A table with that name exists from an older stack, or `STACK_NAME` differs from your manual deploy. Use the same stack name, or delete the old table/stack. If a stack is stuck in `ROLLBACK_COMPLETE`, delete it and redeploy. |
 | `Cannot find esbuild. esbuild must be installed on the host machine` | `src/package.json` is missing, in the wrong folder, or not committed (check with `git ls-files src/`). The workflow also installs esbuild globally as a safeguard; for local builds run `npm install --global esbuild@0.25` or fix `src/package.json`. |
