@@ -1,6 +1,25 @@
 # Orders Service (AWS SAM)
 
-A serverless application that saves orders to a multi-Region DynamoDB table behind an authenticated, rate-limited REST API.
+A serverless application that saves orders to a multi-Region DynamoDB table behind an authenticated, rate-limited REST API. Everything is defined as code in one AWS SAM template and deployed from GitHub Actions or the SAM CLI.
+
+## Project scope
+
+**In scope**
+
+- An authenticated, rate-limited REST API to save and read orders: `POST /orders` (through Lambda) and `GET /orders/{orderId}` (direct API Gateway to DynamoDB integration, no Lambda).
+- Orders stored in a DynamoDB global table (on-demand capacity, Streams enabled) with a replica in a second Region.
+- Observability with a CloudWatch dashboard, logs and X-Ray tracing.
+- Infrastructure as code (`template.yaml`) with automatic deployment on every push to `main`.
+- Free-tier and cost notes, and a complete tear-down procedure that keeps the configuration in Git.
+
+**Out of scope**
+
+- Automatic API failover. Only the data is multi-Region; the API, Lambda and Cognito user pool exist in the primary Region only.
+- Migrating data from an earlier single-Region `Orders` table (the update replaces that table).
+- Update, delete and list-all endpoints, pagination, and a front end.
+- Production hardening such as a custom domain, CloudWatch alarms, point-in-time recovery and a resource-scoped deployment policy.
+
+## Services
 
 | Component | Details |
 |-----------|---------|
@@ -11,35 +30,37 @@ A serverless application that saves orders to a multi-Region DynamoDB table behi
 | **WAF** | Web ACL with a rate-based rule (default 100 requests per 5 minutes per IP) attached to the API stage |
 | **CloudWatch** | Dashboard with API Gateway `Count`, `4XXError` and Lambda `Invocations`, `Errors` |
 | **IAM** | Lambda role (`dynamodb:PutItem`, one table) and API Gateway role (`dynamodb:Query`, one table), both created by the template |
+| **CloudFormation** | The SAM template is deployed as the stack `orders-service`, which creates every resource above |
 | **CI/CD** | GitHub Actions workflow deploys on every push to `main` |
 
-```
-                          +--------------------+
- client --(Cognito JWT)-->|  WAF + API Gateway |
-                          +----+----------+----+
-                   POST /orders|          |GET /orders/{orderId}
-                               v          |  (mapping templates, no Lambda)
-                         +-----------+    |
-                         |  Lambda   |    |
-                         +-----+-----+    |
-                               |PutItem   |Query
-                               v          v
-                     +------------------------------+
-                     |  DynamoDB global table       |
-                     |  primary Region  <--replicates--> replica Region
-                     +------------------------------+
-```
+## Architecture
+
+![Orders Service architecture: a client calls Amazon API Gateway, protected by AWS WAF and Amazon Cognito. POST requests go through AWS Lambda to an Amazon DynamoDB global table; GET requests query DynamoDB directly. The table replicates to a second Region. CloudWatch and X-Ray observe the stack, which GitHub Actions deploys with CloudFormation.](docs/architecture.svg)
+
+Diagram drawn with the [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/). How a request flows:
+
+1. The client signs in with Amazon Cognito and sends the ID token (JWT) with every request to Amazon API Gateway.
+2. AWS WAF rate-limits each client IP, and the Cognito authorizer validates the token before the request reaches any backend.
+3. `POST /orders` invokes the Lambda function, which writes the item to DynamoDB (`PutItem`).
+4. `GET /orders/{orderId}` is answered by API Gateway itself: mapping templates turn the request into a DynamoDB `Query` and the response back into plain JSON, with no Lambda involved.
+5. The DynamoDB global table replicates every write to the replica Region through DynamoDB Streams.
+6. API Gateway and Lambda metrics and logs go to CloudWatch; Lambda traces go to X-Ray.
+7. A push to `main` starts GitHub Actions, which runs `sam build` and `sam deploy`; CloudFormation creates or updates every resource.
 
 ## Project structure
 
 ```
 .
 ├── .github/
+│   ├── dependabot.yml
 │   └── workflows/
 │       └── deploy.yml
+├── docs/
+│   └── architecture.svg
 ├── src/
 │   ├── app.mjs
-│   └── package.json
+│   ├── package.json
+│   └── package-lock.json
 ├── .gitignore
 ├── template.yaml
 └── README.md
@@ -72,7 +93,7 @@ aws sts get-caller-identity   # confirms which account you are using
 - **Small package.** `template.yaml` tells `sam build` to bundle `src/app.mjs` with esbuild (minified, ES2022, no source map). The AWS SDK v3 is marked `External` because the Node.js 22 runtime already includes it, so the deployed package contains only your code (a few KB instead of megabytes). `src/package.json` only lists esbuild as a dev dependency, so nothing else is installed into the package.
 - **Initialisation outside the handler.** The table name is read once, the `DynamoDBClient` and `DynamoDBDocumentClient` are created once at module load, and constants such as the response headers are defined once. All of this runs on a cold start only; warm invocations reuse it. The handler contains only per-request work. SDK v3 keeps HTTPS connections alive by default, so no extra connection-reuse setting is needed. If `TABLE_NAME` is missing, the cold start fails immediately instead of failing every request.
 - **Input validation.** `orderId` and `itemId` must be non-empty strings (a wrong type is rejected with `400` instead of causing a DynamoDB error), and `createdAt` is always set by the server.
-- Optional: run `npm install --package-lock-only` inside `src/` and commit `package-lock.json` to make esbuild installs reproducible.
+- **Reproducible builds.** `src/package-lock.json` is committed, so every `sam build` installs the same esbuild version. Dependabot keeps it up to date (see Part 3).
 
 ### Direct API Gateway to DynamoDB integration (no Lambda)
 
@@ -131,6 +152,23 @@ CloudFormation cannot convert an `AWS::DynamoDB::Table` into a global table in p
 
 2. The new table has a generated name, shown in the stack output `OrdersTableName`. The Lambda function and the API role use it automatically.
 3. Update the deployment IAM user's policy first (see Part 3), otherwise creating the replica fails.
+
+---
+
+## Free tier and costs
+
+Everything in this project deploys on an AWS free tier / Free Plan account, but not everything is free.
+
+| Item | Cost |
+|------|------|
+| **AWS WAF** | Not free. Roughly $6/month while the stack exists (web ACL plus one rule, plus a small per-request charge); verify on the AWS pricing page. This is the main fixed cost. |
+| **DynamoDB** | Always-free allowances: 25 GB storage per Region and 2.5 million Streams read requests per month. The free read/write capacity units (including the 25 replicated write units for global tables) apply to provisioned capacity, not to this on-demand table, so requests are billed per million at tiny rates; a few test requests cost a fraction of a cent. Replicated writes cost more than normal writes and the replica stores its own copy of the data. There is no hourly charge for the replica. |
+| **DynamoDB Streams** | Enabling Streams is free; the first 2.5 million Streams read requests per month are included. Nothing in this project reads the stream itself. |
+| **Lambda, Cognito, X-Ray, CloudWatch dashboard** | Within the free allowances at test volumes. |
+| **API Gateway (REST)** | Free allowance depends on your account type (older accounts: a free calls allowance for 12 months). The direct DynamoDB integration costs the same as any other REST API call. |
+| **Point-in-time recovery** | Not enabled (it is billed per GB). |
+
+New accounts on the Free Plan can use their AWS credits for these charges. To stop all charges, follow [Part 4](#part-4-tear-down-and-stop-all-costs-keep-the-configuration) and delete the stack (this also deletes the replica) when you are not testing. The configuration stays in Git, so you can redeploy at any time.
 
 ---
 
@@ -300,7 +338,7 @@ Then send a burst of requests. WAF evaluates the counts with a short delay, so b
 sam delete --stack-name orders-service
 ```
 
-See Part 4 for the complete tear-down checklist, including the replica Region and leftovers that `sam delete` does not remove.
+See [Part 4](#part-4-tear-down-and-stop-all-costs-keep-the-configuration) for the complete tear-down checklist, including the replica Region and leftovers that `sam delete` does not remove.
 
 ---
 
@@ -308,7 +346,7 @@ See Part 4 for the complete tear-down checklist, including the replica Region an
 
 The workflow in `.github/workflows/deploy.yml` runs on every push to `main` (and can be started manually from the Actions tab). It:
 
-1. Checks out the code and installs Python, Node.js 22 and the SAM CLI.
+1. Checks out the code and installs Python, Node.js 22, esbuild and the SAM CLI.
 2. Configures AWS credentials from GitHub repository secrets.
 3. Checks that `REPLICA_REGION` differs from `AWS_REGION`.
 4. Runs `sam validate --lint`.
@@ -460,6 +498,10 @@ Stored access keys work, but they never expire unless you rotate them. If you wa
        aws-region: ${{ env.AWS_REGION }}
    ```
 
+### Dependency updates (Dependabot)
+
+`.github/dependabot.yml` makes Dependabot open a pull request every week for outdated npm dependencies in `src/` (esbuild) and for outdated GitHub Actions versions used by the workflow. Merging one of these pull requests into `main` triggers a deployment, so review the build result before merging.
+
 ### Security tips
 
 - Rotate the access key periodically (`aws iam create-access-key`, update the secrets, then delete the old key).
@@ -574,23 +616,6 @@ In the AWS console, **Billing and Cost Management > Cost Explorer** shows whethe
 3. Push to `main`, or run the workflow from the Actions tab (or `sam build && sam deploy` locally).
 
 All resources are recreated from the template. The table will be empty and users must sign up again; restore the exported items if needed.
-
----
-
-## Cost notes (free tier)
-
-Everything in this project deploys on an AWS free tier / Free Plan account, but not everything is free.
-
-| Item | Cost |
-|------|------|
-| **AWS WAF** | Not free. Roughly $6/month while the stack exists (web ACL plus one rule, plus a small per-request charge); verify on the AWS pricing page. This is the main fixed cost. |
-| **DynamoDB** | Always-free allowances: 25 GB storage per Region and 2.5 million Streams read requests per month. The free read/write capacity units (including the 25 replicated write units for global tables) apply to provisioned capacity, not to this on-demand table, so requests are billed per million at tiny rates; a few test requests cost a fraction of a cent. Replicated writes cost more than normal writes and the replica stores its own copy of the data. There is no hourly charge for the replica. |
-| **DynamoDB Streams** | Enabling Streams is free; the first 2.5 million Streams read requests per month are included. Nothing in this project reads the stream itself. |
-| **Lambda, Cognito, X-Ray, CloudWatch dashboard** | Within the free allowances at test volumes. |
-| **API Gateway (REST)** | Free allowance depends on your account type (older accounts: a free calls allowance for 12 months). The direct DynamoDB integration costs the same as any other REST API call. |
-| **Point-in-time recovery** | Not enabled (it is billed per GB). |
-
-New accounts on the Free Plan can use their AWS credits for these charges. To stop all charges, follow Part 4 and delete the stack (this also deletes the replica) when you are not testing.
 
 ---
 
